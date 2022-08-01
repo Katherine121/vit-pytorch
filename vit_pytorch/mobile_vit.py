@@ -1,247 +1,147 @@
 import torch
 import torch.nn as nn
+from thop import profile
 
-from einops import rearrange
-from einops.layers.torch import Reduce
+from .module import InvertedResidual, MobileVitBlock
 
-# helpers
+model_cfg = {
+    "xxs": {
+        "features": [16, 16, 24, 24, 48, 48, 64, 64, 80, 80, 320],
+        "d": [64, 80, 96],
+        "expansion_ratio": 2,
+        "layers": [2, 4, 3]
+    },
+    "xs": {
+        "features": [16, 32, 48, 48, 64, 64, 80, 80, 96, 96, 384],
+        "d": [96, 120, 144],
+        "expansion_ratio": 4,
+        "layers": [2, 4, 3]
+    },
+    "s": {
+        "features": [16, 32, 64, 64, 96, 96, 128, 128, 160, 160, 640],
+        "d": [144, 192, 240],
+        "expansion_ratio": 4,
+        "layers": [2, 4, 3]
+    },
+}
 
-def conv_1x1_bn(inp, oup):
-    return nn.Sequential(
-        nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
-        nn.BatchNorm2d(oup),
-        nn.SiLU()
-    )
-
-def conv_nxn_bn(inp, oup, kernal_size=3, stride=1):
-    return nn.Sequential(
-        nn.Conv2d(inp, oup, kernal_size, stride, 1, bias=False),
-        nn.BatchNorm2d(oup),
-        nn.SiLU()
-    )
-
-# classes
-
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-
-    def forward(self, x, **kwargs):
-        return self.fn(self.norm(x), **kwargs)
-
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class Attention(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.):
-        super().__init__()
-        inner_dim = dim_head * heads
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-
-        self.attend = nn.Softmax(dim=-1)
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
-
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x):
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(
-            t, 'b p n (h d) -> b p h n d', h=self.heads), qkv)
-
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        attn = self.attend(dots)
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b p h n d -> b p n (h d)')
-        return self.to_out(out)
-
-class Transformer(nn.Module):
-    """Transformer block described in ViT.
-    Paper: https://arxiv.org/abs/2010.11929
-    Based on: https://github.com/lucidrains/vit-pytorch
-    """
-
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout=0.):
-        super().__init__()
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(dim, heads, dim_head, dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_dim, dropout))
-            ]))
-
-    def forward(self, x):
-        for attn, ff in self.layers:
-            x = attn(x) + x
-            x = ff(x) + x
-        return x
-
-class MV2Block(nn.Module):
-    """MV2 block described in MobileNetV2.
-    Paper: https://arxiv.org/pdf/1801.04381
-    Based on: https://github.com/tonylins/pytorch-mobilenet-v2
-    """
-
-    def __init__(self, inp, oup, stride=1, expansion=4):
-        super().__init__()
-        self.stride = stride
-        assert stride in [1, 2]
-
-        hidden_dim = int(inp * expansion)
-        self.use_res_connect = self.stride == 1 and inp == oup
-
-        if expansion == 1:
-            self.conv = nn.Sequential(
-                # dw
-                nn.Conv2d(hidden_dim, hidden_dim, 3, stride,
-                          1, groups=hidden_dim, bias=False),
-                nn.BatchNorm2d(hidden_dim),
-                nn.SiLU(),
-                # pw-linear
-                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup),
-            )
-        else:
-            self.conv = nn.Sequential(
-                # pw
-                nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(hidden_dim),
-                nn.SiLU(),
-                # dw
-                nn.Conv2d(hidden_dim, hidden_dim, 3, stride,
-                          1, groups=hidden_dim, bias=False),
-                nn.BatchNorm2d(hidden_dim),
-                nn.SiLU(),
-                # pw-linear
-                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup),
-            )
-
-    def forward(self, x):
-        out = self.conv(x)
-        if self.use_res_connect:
-            out = out + x
-        return out
-
-class MobileViTBlock(nn.Module):
-    def __init__(self, dim, depth, channel, kernel_size, patch_size, mlp_dim, dropout=0.):
-        super().__init__()
-        self.ph, self.pw = patch_size
-
-        self.conv1 = conv_nxn_bn(channel, channel, kernel_size)
-        self.conv2 = conv_1x1_bn(channel, dim)
-
-        self.transformer = Transformer(dim, depth, 4, 8, mlp_dim, dropout)
-
-        self.conv3 = conv_1x1_bn(dim, channel)
-        self.conv4 = conv_nxn_bn(2 * channel, channel, kernel_size)
-
-    def forward(self, x):
-        y = x.clone()
-
-        # Local representations
-        x = self.conv1(x)
-        x = self.conv2(x)
-
-        # Global representations
-        _, _, h, w = x.shape
-        x = rearrange(x, 'b d (h ph) (w pw) -> b (ph pw) (h w) d',
-                      ph=self.ph, pw=self.pw)
-        x = self.transformer(x)
-        x = rearrange(x, 'b (ph pw) (h w) d -> b d (h ph) (w pw)',
-                      h=h//self.ph, w=w//self.pw, ph=self.ph, pw=self.pw)
-
-        # Fusion
-        x = self.conv3(x)
-        x = torch.cat((x, y), 1)
-        x = self.conv4(x)
-        return x
 
 class MobileViT(nn.Module):
-    """MobileViT.
-    Paper: https://arxiv.org/abs/2110.02178
-    Based on: https://github.com/chinhsuanwu/mobilevit-pytorch
-    """
+    def __init__(self, img_size, features_list, d_list, transformer_depth, expansion, num_classes=1000):
+        super(MobileViT, self).__init__()
 
-    def __init__(
-        self,
-        image_size,
-        dims,
-        channels,
-        num_classes,
-        expansion=4,
-        kernel_size=3,
-        patch_size=(2, 2),
-        depths=(2, 4, 3)
-    ):
-        super().__init__()
-        assert len(dims) == 3, 'dims must be a tuple of 3'
-        assert len(depths) == 3, 'depths must be a tuple of 3'
-
-        ih, iw = image_size
-        ph, pw = patch_size
-        assert ih % ph == 0 and iw % pw == 0
-
-        init_dim, *_, last_dim = channels
-
-        self.conv1 = conv_nxn_bn(3, init_dim, stride=2)
-
-        self.stem = nn.ModuleList([])
-        self.stem.append(MV2Block(channels[0], channels[1], 1, expansion))
-        self.stem.append(MV2Block(channels[1], channels[2], 2, expansion))
-        self.stem.append(MV2Block(channels[2], channels[3], 1, expansion))
-        self.stem.append(MV2Block(channels[2], channels[3], 1, expansion))
-
-        self.trunk = nn.ModuleList([])
-        self.trunk.append(nn.ModuleList([
-            MV2Block(channels[3], channels[4], 2, expansion),
-            MobileViTBlock(dims[0], depths[0], channels[5],
-                           kernel_size, patch_size, int(dims[0] * 2))
-        ]))
-
-        self.trunk.append(nn.ModuleList([
-            MV2Block(channels[5], channels[6], 2, expansion),
-            MobileViTBlock(dims[1], depths[1], channels[7],
-                           kernel_size, patch_size, int(dims[1] * 4))
-        ]))
-
-        self.trunk.append(nn.ModuleList([
-            MV2Block(channels[7], channels[8], 2, expansion),
-            MobileViTBlock(dims[2], depths[2], channels[9],
-                           kernel_size, patch_size, int(dims[2] * 4))
-        ]))
-
-        self.to_logits = nn.Sequential(
-            conv_1x1_bn(channels[-2], last_dim),
-            Reduce('b c h w -> b c', 'mean'),
-            nn.Linear(channels[-1], num_classes, bias=False)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels=3, out_channels=features_list[0], kernel_size=3, stride=2, padding=1),
+            InvertedResidual(in_channels=features_list[0], out_channels=features_list[1], stride=1,
+                             expand_ratio=expansion),
         )
 
+        self.stage1 = nn.Sequential(
+            InvertedResidual(in_channels=features_list[1], out_channels=features_list[2], stride=2,
+                             expand_ratio=expansion),
+            InvertedResidual(in_channels=features_list[2], out_channels=features_list[2], stride=1,
+                             expand_ratio=expansion),
+            InvertedResidual(in_channels=features_list[2], out_channels=features_list[3], stride=1,
+                             expand_ratio=expansion)
+        )
+
+        self.stage2 = nn.Sequential(
+            InvertedResidual(in_channels=features_list[3], out_channels=features_list[4], stride=2,
+                             expand_ratio=expansion),
+            MobileVitBlock(in_channels=features_list[4], out_channels=features_list[5], d_model=d_list[0],
+                           layers=transformer_depth[0], mlp_dim=d_list[0] * 2)
+        )
+
+        self.stage3 = nn.Sequential(
+            InvertedResidual(in_channels=features_list[5], out_channels=features_list[6], stride=2,
+                             expand_ratio=expansion),
+            MobileVitBlock(in_channels=features_list[6], out_channels=features_list[7], d_model=d_list[1],
+                           layers=transformer_depth[1], mlp_dim=d_list[1] * 4)
+        )
+
+        self.stage4 = nn.Sequential(
+            InvertedResidual(in_channels=features_list[7], out_channels=features_list[8], stride=2,
+                             expand_ratio=expansion),
+            MobileVitBlock(in_channels=features_list[8], out_channels=features_list[9], d_model=d_list[2],
+                           layers=transformer_depth[2], mlp_dim=d_list[2] * 4),
+            nn.Conv2d(in_channels=features_list[9], out_channels=features_list[10], kernel_size=1, stride=1, padding=0)
+        )
+
+        self.avgpool = nn.AvgPool2d(kernel_size=img_size // 32)
+        self.fc = nn.Linear(features_list[10], num_classes)
+
     def forward(self, x):
-        x = self.conv1(x)
+        # Stem
+        x = self.stem(x)
+        # Body
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        # Head
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
 
-        for conv in self.stem:
-            x = conv(x)
 
-        for conv, attn in self.trunk:
-            x = conv(x)
-            x = attn(x)
+def MobileViT_XXS(img_size=256, num_classes=400):
+    cfg_xxs = model_cfg["xxs"]
+    model_xxs = MobileViT(img_size, cfg_xxs["features"], cfg_xxs["d"], cfg_xxs["layers"], cfg_xxs["expansion_ratio"],
+                          num_classes)
+    return model_xxs
 
-        return self.to_logits(x)
+
+def MobileViT_XS(img_size=256, num_classes=400):
+    cfg_xs = model_cfg["xs"]
+    model_xs = MobileViT(img_size, cfg_xs["features"], cfg_xs["d"], cfg_xs["layers"], cfg_xs["expansion_ratio"],
+                         num_classes)
+    return model_xs
+
+
+def MobileViT_S(img_size=256, num_classes=400):
+    cfg_s = model_cfg["s"]
+    model_s = MobileViT(img_size, cfg_s["features"], cfg_s["d"], cfg_s["layers"], cfg_s["expansion_ratio"],
+                        num_classes)
+    return model_s
+
+
+if __name__ == "__main__":
+    # a = torch.tensor([[1, 3], [4, 2], [6, 3]], dtype=torch.float32)
+    # b = torch.tensor([[1.2, 3.3], [4.1, 1.8], [5.2, 3.6]], dtype=torch.float32)
+    # print(a)
+    # print(b)
+    # 相减，求平方，所有元素求平均
+    # （相减，求平方，行加在一起除以一行的个数，列加在一起除以一列的个数
+    # c = nn.functional.mse_loss(a, b)
+    # 相减，求绝对值，所有元素求平均
+    # （相减，求绝对值，行加在一起除以一行的个数，列加在一起除以一列的个数
+    # d = nn.functional.l1_loss(a, b)
+    # 相减，求平方，行加在一起求根号，列不加在一起
+    # 如果需要求列的平均值，那么使用.sum()/batch_size
+    # e = nn.functional.pairwise_distance(a, b)
+    # print(c)
+    # print(d)
+    # print(e)
+
+    cfg_xxs = model_cfg["xxs"]
+    model_xxs = MobileViT(256, cfg_xxs["features"], cfg_xxs["d"], cfg_xxs["layers"], cfg_xxs["expansion_ratio"],
+                          num_classes=400)
+
+    cfg_xs = model_cfg["xs"]
+    model_xs = MobileViT(256, cfg_xs["features"], cfg_xs["d"], cfg_xs["layers"], cfg_xs["expansion_ratio"],
+                         num_classes=400)
+
+    cfg_s = model_cfg["s"]
+    model_s = MobileViT(256, cfg_s["features"], cfg_s["d"], cfg_s["layers"], cfg_s["expansion_ratio"],
+                        num_classes=400)
+
+    print(model_s)
+
+    x = torch.randn(1, 3, 256, 256)
+
+    # XXS: 1.3M 、 XS: 2.3M 、 S: 5.6M
+    flops, params = profile(model_s, (x,))
+    # flops, params = profile(model, (x,z,))
+    print('flops: ', flops, 'params: ', params)
+    print('flops: %.2f M, params: %.2f M' % (flops / 1000000.0, params / 1000000.0))
